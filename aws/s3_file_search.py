@@ -85,6 +85,7 @@ Usage examples:
 import argparse
 import csv
 import io
+import itertools
 import json
 import os
 import sys
@@ -276,7 +277,33 @@ def print_separator(char: str = "-", width: int = 80):
 
 
 def warn(msg: str):
-    print(f"\n⚠️  WARNING: {msg}\n", file=sys.stderr)
+    print(c(f"\n⚠️  WARNING: {msg}\n", _C.YELLOW, _C.BOLD), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Terminal colour helpers — auto-disabled when output is not a TTY
+# ---------------------------------------------------------------------------
+
+class _C:
+    """ANSI escape codes."""
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN   = "\033[36m"
+
+
+# Evaluated once at import time; True when at least one stream is interactive.
+_COLOR_ENABLED = sys.stdout.isatty() or sys.stderr.isatty()
+
+
+def c(text: str, *codes: str) -> str:
+    """Wrap *text* in ANSI escape codes if a TTY is detected, else return plain text."""
+    if not _COLOR_ENABLED:
+        return str(text)
+    return "".join(codes) + str(text) + _C.RESET
 
 
 # Filename date patterns — e.g. Catalog_Mar092026.csv, inventory_2026-03-09.csv
@@ -614,6 +641,73 @@ def search_columns_in_file(
     return hits
 
 
+def stream_search_columns(
+    client,
+    bucket: str,
+    key: str,
+    version_id: str | None,
+    criteria: list[tuple[str, str]],
+    combine: str,
+    encoding: str = "utf-8-sig",
+    case_sensitive: bool = False,
+) -> list[dict]:
+    """
+    Stream an S3 object and search for matching rows without loading the
+    entire file into memory.  Uses boto3 StreamingBody.iter_lines() so only
+    one line at a time is buffered — safe for files of any size.
+    """
+    kwargs: dict = {"Bucket": bucket, "Key": key}
+    if version_id:
+        kwargs["VersionId"] = version_id
+    response = client.get_object(**kwargs)
+    body = response["Body"]
+
+    try:
+        lines = body.iter_lines()
+
+        # Peek at the first few lines to sniff the delimiter, then replay them.
+        sample_lines: list[bytes] = list(itertools.islice(lines, 8))
+        if not sample_lines:
+            return []
+
+        sample = "\n".join(ln.decode(encoding, errors="replace") for ln in sample_lines)
+        delimiter = detect_delimiter(sample[:4096])
+
+        def _text_rows():
+            for ln in sample_lines:
+                yield ln.decode(encoding, errors="replace")
+            for ln in lines:
+                yield ln.decode(encoding, errors="replace")
+
+        reader = csv.DictReader(_text_rows(), delimiter=delimiter)
+        reader.fieldnames = [f.strip() for f in (reader.fieldnames or [])]
+        fieldnames = reader.fieldnames or []
+
+        resolved: list[tuple[str, str]] = []
+        for column, value in criteria:
+            col_lower = column.lower()
+            matched_col = next((f for f in fieldnames if f.lower() == col_lower), None)
+            if matched_col is None:
+                return []
+            needle = value if case_sensitive else value.lower()
+            resolved.append((matched_col, needle))
+
+        hits: list[dict] = []
+        for row in reader:
+            row_matches = []
+            for matched_col, needle in resolved:
+                cell = row.get(matched_col, "") or ""
+                haystack = cell if case_sensitive else cell.lower()
+                row_matches.append(needle in haystack)
+            if combine == "and" and all(row_matches):
+                hits.append(dict(row))
+            elif combine == "or" and any(row_matches):
+                hits.append(dict(row))
+        return hits
+    finally:
+        body.close()
+
+
 # ---------------------------------------------------------------------------
 # Output formatters
 # ---------------------------------------------------------------------------
@@ -634,12 +728,12 @@ def print_hits_text(all_hits: list[dict], criteria: list[tuple[str, str]], combi
         key, vid, mod, latest = k
         rows = [h["row"] for h in hlist]
         print_separator("-")
-        print(f"File     : {key}")
-        print(f"Version  : {vid}  |  Modified: {mod}  |  Latest: {latest or 'No'}")
+        print(f"{c('File     :', _C.BOLD)} {c(key, _C.CYAN)}")
+        print(f"{c('Version  :', _C.BOLD)} {vid}  |  Modified: {mod}  |  Latest: {latest or 'No'}")
         if len(criteria) > 1:
-            crit_str = ", ".join(f"{c}={v!r}" for c, v in criteria)
-            print(f"Criteria : {crit_str}  (combine={combine})")
-        print(f"Matches  : {len(rows)}")
+            crit_str = ", ".join(f"{col}={v!r}" for col, v in criteria)
+            print(f"{c('Criteria :', _C.BOLD)} {crit_str}  (combine={combine})")
+        print(f"{c('Matches  :', _C.BOLD)} {c(str(len(rows)), _C.GREEN, _C.BOLD)}")
         print()
 
         if rows:
@@ -656,7 +750,7 @@ def print_hits_text(all_hits: list[dict], criteria: list[tuple[str, str]], combi
         print()
 
     print_separator("=")
-    print(f"Done. {len(all_hits)} total row(s) matched.")
+    print(c(f"Done. {len(all_hits)} total row(s) matched.", _C.GREEN, _C.BOLD))
 
 
 def print_hits_json(
@@ -738,11 +832,11 @@ def cmd_list(args, client):
     try:
         objects = list_matching_objects(client, bucket, prefix, filename_filter)
     except ClientError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(c(f"ERROR: {e}", _C.RED, _C.BOLD), file=sys.stderr)
         sys.exit(1)
 
     if not objects:
-        print("\nNo objects found.")
+        print(c("\nNo objects found.", _C.YELLOW))
         return
 
     total = len(objects)
@@ -756,7 +850,7 @@ def cmd_list(args, client):
     mod_w = 70
     mod_header = format_datetime_unified_short_header()
     mod_w = max(mod_w, len(mod_header))
-    print(f"\nFound {total} object(s):\n")
+    print(f"\nFound {c(str(total), _C.BOLD)} object(s):\n")
     print(f"{'#':<6} {mod_header:<{mod_w}} {'Size':<12} Key")
     print_separator()
     for i, obj in enumerate(
@@ -764,9 +858,9 @@ def cmd_list(args, client):
     ):
         mod = format_datetime_unified(obj["LastModified"])
         size = format_size(obj["Size"])
-        print(f"{i:<6} {mod:<{mod_w}} {size:<12} {obj['Key']}")
+        print(f"{i:<6} {mod:<{mod_w}} {size:<12} {c(obj['Key'], _C.CYAN)}")
     print_separator()
-    print(f"Total: {total}")
+    print(f"Total: {c(str(total), _C.BOLD)}")
 
 
 def cmd_columns(args, client):
@@ -780,10 +874,10 @@ def cmd_columns(args, client):
         try:
             matches = list_matching_objects(client, bucket, prefix, args.filename)
         except ClientError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            print(c(f"ERROR: {e}", _C.RED, _C.BOLD), file=sys.stderr)
             sys.exit(1)
         if not matches:
-            print(f"No objects found matching '{args.filename}' under '{prefix}'.")
+            print(c(f"No objects found matching '{args.filename}' under '{prefix}'.", _C.YELLOW))
             sys.exit(1)
         if len(matches) > 1:
             print(
@@ -793,7 +887,7 @@ def cmd_columns(args, client):
         matches.sort(key=lambda o: o["LastModified"], reverse=True)
         key = matches[0]["Key"]
     else:
-        print("ERROR: Provide --key or --filename to identify the file.", file=sys.stderr)
+        print(c("ERROR: Provide --key or --filename to identify the file.", _C.RED, _C.BOLD), file=sys.stderr)
         sys.exit(1)
 
     print(f"Bucket : {bucket}")
@@ -801,18 +895,20 @@ def cmd_columns(args, client):
     print_separator("=")
 
     try:
-        raw = download_object(client, bucket, key)
+        # Fetch only the first 16 KB — more than enough to read the header row.
+        response = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-16383")
+        raw = response["Body"].read()
     except ClientError as e:
-        print(f"ERROR downloading file: {e}", file=sys.stderr)
+        print(c(f"ERROR downloading file: {e}", _C.RED, _C.BOLD), file=sys.stderr)
         sys.exit(1)
 
     columns = read_columns(raw)
 
     if not columns:
-        print("Could not read columns — file may be empty or not CSV/TSV.")
+        print(c("Could not read columns — file may be empty or not CSV/TSV.", _C.YELLOW))
         sys.exit(1)
 
-    print(f"\nFound {len(columns)} column(s):\n")
+    print(f"\nFound {c(str(len(columns)), _C.BOLD)} column(s):\n")
     for i, col in enumerate(columns, 1):
         print(f"  {i:>3}.  {col}")
     print()
@@ -842,7 +938,7 @@ def cmd_search(args, client):
         print(f"Column : {criteria[0][0]}", file=info)
         print(f"Value  : {criteria[0][1]}", file=info)
     else:
-        crit_str = ", ".join(f"{c}={v!r}" for c, v in criteria)
+        crit_str = ", ".join(f"{col}={v!r}" for col, v in criteria)
         print(f"Criteria : {crit_str}  (combine={combine})", file=info)
     print(f"From   : {format_datetime_unified(start)}", file=info)
     print(f"To     : {format_datetime_unified(end)}", file=info)
@@ -852,17 +948,17 @@ def cmd_search(args, client):
     try:
         matches = list_matching_objects(client, bucket, prefix, filename_filter, start=start, end=end)
     except ClientError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(c(f"ERROR: {e}", _C.RED, _C.BOLD), file=sys.stderr)
         sys.exit(1)
 
     if not matches:
-        print(f"\nNo objects found matching '{filename_filter}' under '{prefix}' in the specified timeframe.", file=info)
+        print(c(f"\nNo objects found matching '{filename_filter}' under '{prefix}' in the specified timeframe.", _C.YELLOW), file=info)
         if output_fmt == "json":
             print(json.dumps({"query": _build_query(args), "total_matches": 0, "results": []}, indent=2))
         sys.exit(0)
 
     total_files = len(matches)
-    print(f"\nFound {total_files} object(s) matching '{filename_filter}'.", file=info)
+    print(f"\nFound {c(str(total_files), _C.BOLD)} object(s) matching '{filename_filter}'.", file=info)
 
     if total_files > LARGE_RESULT_WARNING:
         warn(f"{total_files} files found — consider narrowing --path or --filename.")
@@ -872,7 +968,7 @@ def cmd_search(args, client):
 
     for obj in matches:
         key = obj["Key"]
-        print(f"\n  Checking versions: {key}", file=info)
+        print(f"\n  {c('Checking versions:', _C.CYAN)} {key}", file=info)
 
         try:
             versions = list_versions_in_timeframe(client, bucket, key, start, end)
@@ -884,22 +980,24 @@ def cmd_search(args, client):
                              "Size": obj["Size"], "IsLatest": True}]
 
         if not versions:
-            print(f"    No versions in timeframe.", file=info)
+            print(c("    No versions in timeframe.", _C.DIM), file=info)
             continue
 
         n_crit = len(criteria)
         crit_desc = f"searching {n_crit} criterion/criteria (combine={combine})"
-        print(f"    {len(versions)} version(s) in timeframe — {crit_desc}...", file=info)
+        print(f"    {c(str(len(versions)), _C.BOLD)} version(s) in timeframe — {crit_desc}...", file=info)
 
         for ver in versions:
             vid = ver.get("VersionId")
             try:
-                raw = download_object(client, bucket, key, vid)
+                hits = stream_search_columns(
+                    client, bucket, key, vid,
+                    criteria, combine,
+                    case_sensitive=args.case_sensitive,
+                )
             except ClientError as e:
-                print(f"    ERROR downloading version {vid}: {e}", file=sys.stderr)
+                print(c(f"    ERROR downloading version {vid}: {e}", _C.RED, _C.BOLD), file=sys.stderr)
                 continue
-
-            hits = search_columns_in_file(raw, criteria, combine, case_sensitive=args.case_sensitive)
             if hits:
                 lm = ver["LastModified"]
                 mod = format_datetime_unified(lm)
@@ -908,7 +1006,7 @@ def cmd_search(args, client):
                     timespec="seconds"
                 )
                 is_latest = "Yes" if ver.get("IsLatest") else ""
-                print(f"    ✓ {len(hits)} match(es)  version={vid or 'N/A'}  modified={mod}  latest={is_latest}", file=info)
+                print(c(f"    ✓ {len(hits)} match(es)  version={vid or 'N/A'}  modified={mod}  latest={is_latest}", _C.GREEN), file=info)
                 for row in hits:
                     all_hits.append({
                         "key": key,
@@ -920,21 +1018,21 @@ def cmd_search(args, client):
                         "row": row,
                     })
             else:
-                print(f"    ✗ No matches  version={vid or 'N/A'}", file=info)
+                print(c(f"    ✗ No matches  version={vid or 'N/A'}", _C.DIM), file=info)
 
     # 3. Output
     print(file=info)
     print("=" * 80, file=info)
 
     if not all_hits:
-        crit_desc = ", ".join(f"{c}={v!r}" for c, v in criteria)
+        crit_desc = ", ".join(f"{col}={v!r}" for col, v in criteria)
         msg = f"\nNo rows matched criteria ({crit_desc}, combine={combine}) in any version within the timeframe."
-        print(msg, file=info)
+        print(c(msg, _C.YELLOW), file=info)
         if output_fmt == "json":
             print(json.dumps({"query": _build_query(args), "total_matches": 0, "results": []}, indent=2))
         sys.exit(0)
 
-    print(f"\nTotal matching rows across all files/versions: {len(all_hits)}\n", file=info)
+    print(c(f"\nTotal matching rows across all files/versions: {len(all_hits)}\n", _C.GREEN, _C.BOLD), file=info)
 
     if output_fmt == "json":
         print_hits_json(all_hits, query=_build_query(args))
@@ -982,15 +1080,15 @@ def cmd_exists(args, client):
     try:
         matches = list_matching_objects(client, bucket, prefix, filename_filter, start=start, end=end)
     except ClientError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(c(f"ERROR: {e}", _C.RED, _C.BOLD), file=sys.stderr)
         sys.exit(1)
 
     if not matches:
-        print(f"\nNo objects found matching '{filename_filter}' under '{prefix}' in the specified timeframe.")
+        print(c(f"\nNo objects found matching '{filename_filter}' under '{prefix}' in the specified timeframe.", _C.YELLOW))
         sys.exit(0)
 
     total = len(matches)
-    print(f"\nFound {total} object(s) matching '{filename_filter}'.\n")
+    print(f"\nFound {c(str(total), _C.BOLD)} object(s) matching '{filename_filter}'.\n")
 
     if total > LARGE_RESULT_WARNING:
         warn(
@@ -1001,23 +1099,23 @@ def cmd_exists(args, client):
     if total == 1:
         obj = matches[0]
         key = obj["Key"]
-        print(f"Single file found: {key}")
+        print(f"Single file found: {c(key, _C.CYAN)}")
         print(
             f"Current LastModified: {format_datetime_unified(obj['LastModified'])}  "
             f"Size: {format_size(obj['Size'])}"
         )
         print_separator()
-        print("Checking versions in timeframe...\n")
+        print(c("Checking versions in timeframe...\n", _C.CYAN))
 
         try:
             versions = list_versions_in_timeframe(client, bucket, key, start, end)
         except ClientError as e:
-            print(f"ERROR listing versions: {e}", file=sys.stderr)
+            print(c(f"ERROR listing versions: {e}", _C.RED, _C.BOLD), file=sys.stderr)
             print("(Bucket versioning may not be enabled.)")
             sys.exit(1)
 
         if not versions:
-            print(f"No versions found for '{key}' in the specified timeframe.")
+            print(c(f"No versions found for '{key}' in the specified timeframe.", _C.YELLOW))
         else:
             mod_w = 70
             mod_h = format_datetime_unified_short_header()
@@ -1028,10 +1126,10 @@ def cmd_exists(args, client):
                 vid = ver["VersionId"]
                 mod = format_datetime_unified(ver["LastModified"])
                 size = format_size(ver["Size"])
-                latest = "Yes" if ver.get("IsLatest") else ""
+                latest = c("Yes", _C.GREEN) if ver.get("IsLatest") else ""
                 print(f"{i:<4} {vid:<35} {mod:<{mod_w}} {size:<12} {latest}")
             print_separator()
-            print(f"Total versions in timeframe: {len(versions)}")
+            print(f"Total versions in timeframe: {c(str(len(versions)), _C.BOLD)}")
 
     else:
         print("Multiple files match — filtering by LastModified in timeframe...\n")
@@ -1043,8 +1141,8 @@ def cmd_exists(args, client):
             filename_matched = filter_by_filename_date(matches, start, end)
             if filename_matched:
                 print(
-                    "No files matched by LastModified, but found file(s) whose "
-                    "filename-encoded date falls within the timeframe:\n"
+                    c("No files matched by LastModified", _C.YELLOW) +
+                    ", but found file(s) whose filename-encoded date falls within the timeframe:\n"
                 )
                 mod_w = 70
                 mod_h = format_datetime_unified_short_header()
@@ -1056,11 +1154,11 @@ def cmd_exists(args, client):
                 ):
                     mod = format_datetime_unified(obj["LastModified"])
                     size = format_size(obj["Size"])
-                    print(f"{i:<4} {mod:<{mod_w}} {size:<12} {obj['Key']}")
+                    print(f"{i:<4} {mod:<{mod_w}} {size:<12} {c(obj['Key'], _C.CYAN)}")
                 print_separator()
-                print(f"Files matched by filename date: {len(filename_matched)} / {total} total")
+                print(f"Files matched by filename date: {c(str(len(filename_matched)), _C.BOLD)} / {total} total")
             else:
-                print("No matching files fall within the specified timeframe.")
+                print(c("No matching files fall within the specified timeframe.", _C.YELLOW))
         else:
             mod_w = 70
             mod_h = format_datetime_unified_short_header()
@@ -1098,9 +1196,9 @@ def cmd_deleted(args, client):
     except ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("NoSuchBucket",):
-            print(f"ERROR: Bucket '{bucket}' not found.", file=sys.stderr)
+            print(c(f"ERROR: Bucket '{bucket}' not found.", _C.RED, _C.BOLD), file=sys.stderr)
         else:
-            print(f"ERROR listing versions: {e}", file=sys.stderr)
+            print(c(f"ERROR listing versions: {e}", _C.RED, _C.BOLD), file=sys.stderr)
             print(
                 "(Bucket may not have versioning enabled — delete markers require versioning.)",
                 file=sys.stderr,
@@ -1108,10 +1206,10 @@ def cmd_deleted(args, client):
         sys.exit(1)
 
     if not markers:
-        print("\nNo delete markers found.")
+        print(c("\nNo delete markers found.", _C.YELLOW))
         return
 
-    print(f"\nFound {len(markers)} delete marker(s):\n")
+    print(f"\nFound {c(str(len(markers)), _C.BOLD)} delete marker(s):\n")
     mod_h = format_datetime_unified_short_header()
     mod_w = max(70, len(mod_h))
     print(f"{'#':<4} {'Version ID':<35} {mod_h:<{mod_w}} {'Latest?':<8} Key")
@@ -1119,8 +1217,8 @@ def cmd_deleted(args, client):
     for i, dm in enumerate(markers, 1):
         vid = dm.get("VersionId", "N/A")
         mod = format_datetime_unified(dm["LastModified"])
-        latest = "Yes" if dm.get("IsLatest") else ""
-        print(f"{i:<4} {vid:<35} {mod:<{mod_w}} {latest:<8} {dm['Key']}")
+        latest = c("Yes", _C.GREEN) if dm.get("IsLatest") else ""
+        print(f"{i:<4} {vid:<35} {mod:<{mod_w}} {latest:<8} {c(dm['Key'], _C.CYAN)}")
     print_separator()
 
     if no_cloudtrail:
@@ -1136,37 +1234,38 @@ def cmd_deleted(args, client):
     ct_start = min(all_times) - timedelta(minutes=5)
     ct_end   = max(all_times) + timedelta(minutes=5)
 
-    print(f"\nLooking up CloudTrail events ({format_datetime_unified(ct_start)} → {format_datetime_unified(ct_end)})...")
+    print(f"\n{c('Looking up CloudTrail events', _C.CYAN)} ({format_datetime_unified(ct_start)} → {format_datetime_unified(ct_end)})...")
     ct_events = lookup_cloudtrail_deletes(args.profile, bucket, unique_keys, ct_start, ct_end)
 
     any_found = any(evts for evts in ct_events.values())
     if not any_found:
-        print(
+        print(c(
             "\nNo CloudTrail DeleteObject events found for these keys in that window.\n"
             "This can mean:\n"
             "  • The deletion happened > 90 days ago (CloudTrail default retention).\n"
             "  • The bucket is in a different region (script uses REGION=" + REGION + ").\n"
             "  • CloudTrail is not enabled for this account/bucket.\n"
-            "  • The deletion was done via a bulk lifecycle rule (not a user API call)."
-        )
+            "  • The deletion was done via a bulk lifecycle rule (not a user API call).",
+            _C.YELLOW,
+        ))
         return
 
     print()
     print_separator("=")
-    print("CloudTrail deletion events:")
+    print(c("CloudTrail deletion events:", _C.BOLD))
     print_separator("=")
     for key, evts in ct_events.items():
         if not evts:
             continue
-        print(f"\nKey: {key}")
+        print(f"\n{c('Key:', _C.BOLD)} {c(key, _C.CYAN)}")
         for ev in evts:
             et = ev["event_time"]
             ts = format_datetime_unified(et) if isinstance(et, datetime) else str(et)
-            print(f"  Event     : {ev['event_name']}  ({ev['event_id']})")
-            print(f"  When      : {ts}")
-            print(f"  Actor     : {ev['actor']}")
-            print(f"  Source IP : {ev['source_ip']}")
-            print(f"  User-Agent: {ev['user_agent']}")
+            print(f"  {c('Event     :', _C.BOLD)} {ev['event_name']}  ({ev['event_id']})")
+            print(f"  {c('When      :', _C.BOLD)} {ts}")
+            print(f"  {c('Actor     :', _C.BOLD)} {ev['actor']}")
+            print(f"  {c('Source IP :', _C.BOLD)} {ev['source_ip']}")
+            print(f"  {c('User-Agent:', _C.BOLD)} {ev['user_agent']}")
             print()
     print_separator("=")
 
