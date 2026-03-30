@@ -37,22 +37,30 @@ except ImportError:
 
 
 def _load_dotenv() -> None:
-    """Load .env from the script's directory into os.environ (existing env wins)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-    if not os.path.isfile(env_path):
-        return
-    with open(env_path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '=' not in line:
-                continue
-            key, _, value = line.partition('=')
-            key = key.strip()
-            value = value.strip().strip("'\"")
-            if key and key not in os.environ:
-                os.environ[key] = value
+    """
+    Load .env into os.environ (existing env wins).
+    Searches the script's directory and each parent up to the filesystem root,
+    stopping at the first .env found.
+    """
+    directory = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        env_path = os.path.join(directory, '.env')
+        if os.path.isfile(env_path):
+            with open(env_path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip().strip("'\"")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+            return
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return
+        directory = parent
 
 
 _load_dotenv()
@@ -61,22 +69,45 @@ S3_BUCKET = 'cut-dry-data-dumps'
 S3_PREFIX = 'cut-dry-master/by_vendor/'
 
 
-def get_repo_root() -> str:
-    """Resolve cut-dry repo root from CUT_DRY_REPO or script location."""
-    repo = os.environ.get('CUT_DRY_REPO')
-    if repo:
-        repo = os.path.abspath(os.path.expanduser(repo))
-    else:
-        # Script lives at scripts/dev_utilities/import-vendor-dump.py
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        repo = os.path.dirname(os.path.dirname(script_dir))
-    index_php = os.path.join(repo, 'public', 'index.php')
-    if not os.path.isfile(index_php):
-        sys.exit(
-            "Cut-dry repo root not found (missing public/index.php). "
-            "Set CUT_DRY_REPO to the path of the cut-dry repo or run this script from within the repo."
-        )
-    return repo
+def _has_index_php(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, 'public', 'index.php'))
+
+
+def get_repo_root(cli_repo: Optional[str] = None) -> str:
+    """
+    Resolve the cut-dry repo root from (in priority order):
+      1. --repo CLI flag
+      2. CUT_DRY_REPO environment variable
+      3. Current working directory
+      4. Script ancestry (legacy: script inside the repo)
+    """
+    candidates: list[tuple[str, str]] = []
+
+    if cli_repo:
+        candidates.append((os.path.abspath(os.path.expanduser(cli_repo)), '--repo flag'))
+
+    env_repo = os.environ.get('CUT_DRY_REPO')
+    if env_repo:
+        candidates.append((os.path.abspath(os.path.expanduser(env_repo)), 'CUT_DRY_REPO env var'))
+
+    candidates.append((os.path.abspath(os.getcwd()), 'current working directory'))
+
+    # Legacy: script inside the repo at scripts/dev_utilities/
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append((os.path.dirname(os.path.dirname(script_dir)), 'script ancestry'))
+
+    for path, source in candidates:
+        if _has_index_php(path):
+            return path
+
+    sys.exit(
+        "Cut-dry repo root not found (missing public/index.php).\n\n"
+        "Fix with one of:\n"
+        f"  python {os.path.basename(__file__)} --repo ~/Dev/cut-dry -v <vendor_id>\n"
+        "  export CUT_DRY_REPO=~/Dev/cut-dry\n"
+        "  cd ~/Dev/cut-dry && python /path/to/import-vendor-dump.py -v <vendor_id>\n\n"
+        f"Tried: {', '.join(p for p, _ in candidates)}"
+    )
 
 
 def choose_dump_key(client, vendor_id: int, dump_key: Optional[str]) -> str:
@@ -235,9 +266,15 @@ def main() -> None:
         metavar='KEY',
         help="Specific S3 key under cut-dry-master/by_vendor/ (default: latest for vendor)",
     )
+    parser.add_argument(
+        '--repo',
+        metavar='PATH',
+        default=None,
+        help="Path to the cut-dry repo root (overrides CUT_DRY_REPO env var)",
+    )
     args = parser.parse_args()
 
-    repo_root = get_repo_root()
+    repo_root = get_repo_root(args.repo)
     print(f"Repo root: {repo_root}")
 
     vendor_id = args.vendor_id if args.vendor_id is not None else args.vendor_id_opt

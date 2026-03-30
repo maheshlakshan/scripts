@@ -121,19 +121,24 @@ Import a verified-vendor SQL dump from S3 (`cut-dry-data-dumps/cut-dry-master/by
 **Usage**
 
 ```bash
+# Run from inside the cut-dry repo
 python aws/import-vendor-dump.py <vendor_id>
 
+# Point at the repo explicitly (from anywhere)
+python aws/import-vendor-dump.py -v <vendor_id> --repo ~/Dev/cut-dry
+
+# Or set the env var once so you never have to pass --repo
+export CUT_DRY_REPO=~/Dev/cut-dry
+python aws/import-vendor-dump.py -v <vendor_id>
+
 # Skip the "vendor exists" prompt and replace automatically
-python aws/import-vendor-dump.py <vendor_id> --replace
+python aws/import-vendor-dump.py -v <vendor_id> --replace
 
 # Non-interactive (CI / scripted use)
-python aws/import-vendor-dump.py <vendor_id> --replace --yes
+python aws/import-vendor-dump.py -v <vendor_id> --replace --yes
 
 # Use a specific dump file instead of the latest
-python aws/import-vendor-dump.py <vendor_id> --dump-key vv-123-2026-03-01.sql.gz
-
-# From a different repo directory
-CUT_DRY_REPO=/path/to/cut-dry python aws/import-vendor-dump.py <vendor_id>
+python aws/import-vendor-dump.py -v <vendor_id> --dump-key vv-123-2026-03-01.sql.gz
 ```
 
 **Docker / Dev Container setup**
